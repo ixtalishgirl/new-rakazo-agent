@@ -31,7 +31,11 @@ import {
   OPENAI_COMPATIBLE_PROVIDER_ID,
   PRIVATE_MODEL_ENDPOINT_MESSAGE,
 } from "./openai-compatible-url.js";
-import { MODEL_CONNECT_TIMEOUT_MS, modelConnectTimeoutMs } from "./pi-runtime-limits.js";
+import {
+  MODEL_CONNECT_TIMEOUT_MS,
+  modelConnectTimeoutMs,
+  modelStreamTimeoutMs,
+} from "./pi-runtime-limits.js";
 import { guardToolCallNames } from "./pi-tool-call-guard.js";
 import { dispatcherFetch, fetchPairedWithDispatcher } from "./undici-fetch.js";
 
@@ -59,6 +63,34 @@ function modelsProbeLimits(catalogProbe?: boolean): { maxBytes: number; maxModel
   return catalogProbe
     ? { maxBytes: CATALOG_MAX_MODELS_RESPONSE_BYTES, maxModelIds: CATALOG_MAX_MODEL_IDS }
     : { maxBytes: MAX_MODELS_RESPONSE_BYTES, maxModelIds: MAX_MODEL_IDS };
+}
+
+/**
+ * Operator flag: serve OpenAI-compatible chat completions without SSE.
+ *
+ * Some model servers sit behind tunnels that drop a long-lived event stream
+ * mid-body; the OpenAI SDK then reports the bare "Connection error." With
+ * this set, a streaming chat-completions request is served as one
+ * non-streaming POST instead, and the completed JSON reply is re-emitted
+ * locally as SSE so the provider API still sees a stream. Off by default:
+ * streaming stays the behavior for every other endpoint.
+ */
+export const OPENAI_COMPATIBLE_NON_STREAMING_ENV = "RAKAZO_OPENAI_COMPAT_NON_STREAMING";
+
+export function openAiCompatibleNonStreaming(): boolean {
+  const value = process.env[OPENAI_COMPATIBLE_NON_STREAMING_ENV]?.trim().toLowerCase();
+  return value === "1" || value === "true" || value === "yes";
+}
+
+/** Tunnel hosts that show a browser warning page unless the request opts out. */
+function isNgrokHost(hostname: string): boolean {
+  const host = hostname.toLowerCase();
+  return (
+    host === "ngrok-free.dev" ||
+    host.endsWith(".ngrok-free.dev") ||
+    host === "ngrok.io" ||
+    host.endsWith(".ngrok.io")
+  );
 }
 
 const OPENAI_COMPAT_BASE = "http://127.0.0.1:1/v1";
@@ -235,6 +267,231 @@ function requestCarriesAuthorization(input: RequestInfo | URL, init?: RequestIni
   return input instanceof Request ? headersCarryAuthorization(input.headers) : false;
 }
 
+/** One non-streaming chat-completions reply, as llama.cpp and OpenAI return it. */
+type NonStreamingToolCall = {
+  id?: string;
+  index?: number;
+  type?: string;
+  function?: { name?: string; arguments?: string };
+  custom?: { name?: string; input?: string };
+};
+
+type NonStreamingMessage = {
+  role?: string;
+  content?: string | Array<{ type?: string; text?: string }> | null;
+  reasoning_content?: string | null;
+  reasoning?: string | null;
+  reasoning_text?: string | null;
+  tool_calls?: NonStreamingToolCall[];
+};
+
+type NonStreamingCompletion = {
+  id?: string;
+  created?: number;
+  model?: string;
+  choices?: Array<{
+    index?: number;
+    message?: NonStreamingMessage;
+    finish_reason?: string | null;
+  }>;
+  usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+};
+
+/** A completed reply is small; still bound so a runaway body cannot grow without limit. */
+const NON_STREAMING_MAX_BODY_BYTES = 16 * 1024 * 1024;
+
+function requestBodyText(init: RequestInit): string | undefined {
+  const body = init.body;
+  if (typeof body === "string") return body;
+  if (body instanceof ArrayBuffer) return new TextDecoder().decode(body);
+  if (body instanceof Uint8Array) return new TextDecoder().decode(body);
+  return undefined;
+}
+
+/** The streaming JSON body of a chat-completions POST, if that is what this is. */
+function streamingChatCompletionsBody(
+  url: URL,
+  init: RequestInit,
+): Record<string, unknown> | undefined {
+  if ((init.method ?? "GET").toUpperCase() !== "POST") return undefined;
+  if (!url.pathname.endsWith("/chat/completions")) return undefined;
+  const text = requestBodyText(init);
+  if (!text) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+  const body = parsed as Record<string, unknown>;
+  return body.stream === true ? body : undefined;
+}
+
+function messageText(content: NonStreamingMessage["content"]): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) =>
+        part && typeof part === "object" && typeof part.text === "string" ? part.text : "",
+      )
+      .join("");
+  }
+  return "";
+}
+
+function firstNonEmptyString(...values: Array<string | null | undefined>): string | undefined {
+  for (const value of values) {
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  return undefined;
+}
+
+/**
+ * Re-emit one completed reply as the SSE chunks the provider API reads: one
+ * delta chunk carrying the whole reply, one chunk with the finish reason, and
+ * a usage-only chunk when the server reported usage. The stream is built
+ * locally from a body already received in full, so it cannot die mid-body.
+ */
+function nonStreamingCompletionToServerSentEvents(completion: unknown): string {
+  const parsed = (completion ?? {}) as NonStreamingCompletion;
+  const choices = Array.isArray(parsed.choices) ? parsed.choices : [];
+  const choice = choices[0];
+  if (!choice?.message) {
+    throw new Error("Model server returned a completion without choices.");
+  }
+  const id = typeof parsed.id === "string" && parsed.id ? parsed.id : "chatcmpl-nonstreaming";
+  const created =
+    typeof parsed.created === "number" ? parsed.created : Math.floor(Date.now() / 1000);
+  const model = typeof parsed.model === "string" ? parsed.model : "";
+  const message = choice.message;
+  const delta: Record<string, unknown> = { role: "assistant" };
+  const text = messageText(message.content);
+  if (text) delta.content = text;
+  const reasoning = firstNonEmptyString(
+    message.reasoning_content,
+    message.reasoning,
+    message.reasoning_text,
+  );
+  if (reasoning) delta.reasoning_content = reasoning;
+  if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+    delta.tool_calls = message.tool_calls.map((call, index) => ({
+      index: typeof call.index === "number" ? call.index : index,
+      ...(call.id ? { id: call.id } : {}),
+      type: "function",
+      ...(call.function
+        ? { function: { name: call.function.name ?? "", arguments: call.function.arguments ?? "" } }
+        : {}),
+      ...(call.custom ? { custom: call.custom } : {}),
+    }));
+  }
+  const base = { id, object: "chat.completion.chunk", created, model };
+  const events: Array<Record<string, unknown>> = [
+    { ...base, choices: [{ index: 0, delta, finish_reason: null }] },
+    { ...base, choices: [{ index: 0, delta: {}, finish_reason: choice.finish_reason ?? "stop" }] },
+  ];
+  if (parsed.usage) events.push({ ...base, choices: [], usage: parsed.usage });
+  return `${events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`;
+}
+
+async function readBoundedText(response: Response, maxBytes: number): Promise<string> {
+  if (!response.body) throw new Error("Model server returned an empty response.");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let bytes = 0;
+  let text = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    bytes += value.byteLength;
+    if (bytes > maxBytes) {
+      await reader.cancel().catch(() => undefined);
+      throw new Error("Model server response is too large.");
+    }
+    text += decoder.decode(value, { stream: true });
+  }
+  return text + decoder.decode();
+}
+
+/** Drop headers that describe the original JSON body, which the SSE body replaces. */
+function serverSentEventHeaders(headers: Headers): Headers {
+  const next = new Headers(headers);
+  next.delete("content-length");
+  next.delete("content-encoding");
+  next.set("content-type", "text/event-stream");
+  return next;
+}
+
+/**
+ * Serve a streaming chat-completions request as one non-streaming POST and
+ * re-emit the completed reply as local SSE. Error responses pass through
+ * untouched so the SDK's error handling sees the server's own status.
+ */
+async function fetchChatCompletionsNonStreaming(
+  transport: typeof globalThis.fetch,
+  url: URL,
+  requestInit: RequestInit,
+  headers: HeadersInit | undefined,
+  body: Record<string, unknown>,
+  dispatcher: Agent,
+): Promise<Response> {
+  const nonStreamingBody: Record<string, unknown> = { ...body, stream: false };
+  delete nonStreamingBody.stream_options;
+  const response = await transport(url, {
+    ...requestInit,
+    method: "POST",
+    headers: new Headers(headers),
+    body: JSON.stringify(nonStreamingBody),
+    redirect: "error",
+    dispatcher,
+  } as RequestInit & { dispatcher: Agent });
+  if (!response.ok) return response;
+  const text = await readBoundedText(response, NON_STREAMING_MAX_BODY_BYTES);
+  let completion: unknown;
+  try {
+    completion = JSON.parse(text);
+  } catch {
+    throw new Error("Model server returned invalid JSON for a non-streaming completion.");
+  }
+  return new Response(nonStreamingCompletionToServerSentEvents(completion), {
+    status: 200,
+    statusText: "OK",
+    headers: serverSentEventHeaders(response.headers),
+  });
+}
+
+function describeErrorCause(cause: unknown, depth = 0): string {
+  if (depth > 2 || cause === null || typeof cause !== "object") return String(cause ?? "");
+  const name = "name" in cause && typeof cause.name === "string" ? cause.name : "Error";
+  const message = cause instanceof Error ? cause.message : String(cause);
+  const nested =
+    "cause" in cause && cause.cause !== undefined
+      ? ` <- ${describeErrorCause(cause.cause, depth + 1)}`
+      : "";
+  return `${name}: ${message}${nested}`;
+}
+
+/**
+ * The transport failure behind a bare "Connection error.", if this error is
+ * one. User aborts carry no diagnosis; policy rejections are already explicit.
+ */
+function transportFailureCause(error: unknown): string | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const name = "name" in error && typeof error.name === "string" ? error.name : "Error";
+  if (name === "AbortError") return undefined;
+  const message = error instanceof Error ? error.message : String(error);
+  const cause = "cause" in error ? error.cause : undefined;
+  const looksTransport =
+    cause !== undefined ||
+    /fetch failed|socket hang up|ECONNRESET|ECONNREFUSED|ENOTFOUND|EHOSTUNREACH|ENETUNREACH|EAI_AGAIN|ETIMEDOUT|Connect Timeout|network|terminated/i.test(
+      `${name}: ${message}`,
+    );
+  if (!looksTransport) return undefined;
+  return cause === undefined
+    ? `${name}: ${message}`
+    : `${name}: ${message} <- ${describeErrorCause(cause)}`;
+}
+
 export function createOpenAiCompatibleFetch(
   baseFetch: typeof globalThis.fetch = dispatcherFetch,
   resolve: ResolveHostname = resolveHostname,
@@ -252,17 +509,10 @@ export function createOpenAiCompatibleFetch(
       );
     }
     const hostname = url.hostname.replace(/^\[|\]$/g, "");
-    const dispatcher = new Agent({
-      connect: {
-        timeout: modelConnectTimeoutMs(),
-        ...(ipVersion(hostname) === 0
-          ? { lookup: createOpenAiCompatibleLookup(url, resolve, opts) }
-          : {}),
-      },
-    });
     // Node's fetch rejects this package Agent. Use its matching fetch;
     // a caller-supplied fetch stays in charge.
     const transport = fetchPairedWithDispatcher(baseFetch);
+    let dispatcher: Agent | undefined;
     try {
       const requestInit = await requestInitFor(input, init);
       let headers = requestInit.headers;
@@ -271,15 +521,54 @@ export function createOpenAiCompatibleFetch(
         for (const [name, value] of Object.entries(customHeaders)) merged.set(name, value);
         headers = merged;
       }
-      const response = await transport(url, {
-        ...requestInit,
-        headers,
-        redirect: "error",
-        dispatcher,
-      } as RequestInit & { dispatcher: Agent });
+      if (isNgrokHost(hostname)) {
+        // The tunnel's browser warning page is HTML, not SSE; ask it off.
+        const merged = new Headers(headers);
+        if (!merged.has("ngrok-skip-browser-warning")) {
+          merged.set("ngrok-skip-browser-warning", "true");
+        }
+        headers = merged;
+      }
+      const streamingBody = openAiCompatibleNonStreaming()
+        ? streamingChatCompletionsBody(url, requestInit)
+        : undefined;
+      dispatcher = new Agent({
+        connect: {
+          timeout: modelConnectTimeoutMs(),
+          ...(ipVersion(hostname) === 0
+            ? { lookup: createOpenAiCompatibleLookup(url, resolve, opts) }
+            : {}),
+        },
+        // A non-streaming body arrives as one read; bound it with the same
+        // per-attempt budget the SDK applies, instead of the 300s defaults.
+        ...(streamingBody
+          ? { headersTimeout: modelStreamTimeoutMs(), bodyTimeout: modelStreamTimeoutMs() }
+          : {}),
+      });
+      const response =
+        streamingBody === undefined
+          ? await transport(url, {
+              ...requestInit,
+              headers,
+              redirect: "error",
+              dispatcher,
+            } as RequestInit & { dispatcher: Agent })
+          : await fetchChatCompletionsNonStreaming(
+              transport,
+              url,
+              requestInit,
+              headers,
+              streamingBody,
+              dispatcher,
+            );
       return await closeDispatcherWithResponse(response, dispatcher);
     } catch (error) {
-      await dispatcher.destroy().catch(() => undefined);
+      const cause = transportFailureCause(error);
+      if (cause !== undefined) {
+        // biome-ignore lint/suspicious/noConsole: Operators need the transport cause behind a bare "Connection error.".
+        console.error(`[openai-compatible] model request failed: ${cause}`);
+      }
+      await dispatcher?.destroy().catch(() => undefined);
       throw error;
     }
   };
