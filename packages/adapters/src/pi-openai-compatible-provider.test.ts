@@ -20,6 +20,7 @@ import {
   createOpenAiCompatibleFetch,
   createOpenAiCompatibleLookup,
   OPENAI_COMPATIBLE_CATALOG_MODEL_ID,
+  OPENAI_COMPATIBLE_NON_STREAMING_ENV,
   openAiCompatibleCatalogProvider,
   prepareOpenAiCompatibleConnect,
   probeOpenAiCompatibleModels,
@@ -1445,5 +1446,242 @@ describe("anthropic-messages wire protocol", () => {
       ),
     ).resolves.toEqual(["claude-fixture"]);
     expect(new Headers(fetchImpl.mock.calls[0]?.[1]?.headers).get("x-api-key")).toBeNull();
+  });
+});
+
+describe("non-streaming openai-compatible completions", () => {
+  const nonStreamingReply = {
+    id: "chatcmpl-fixture",
+    created: 1_700_000_000,
+    model: "fixture-model",
+    choices: [
+      {
+        index: 0,
+        message: { role: "assistant", content: "Hello from the fixture." },
+        finish_reason: "stop",
+      },
+    ],
+    usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+  };
+
+  function setNonStreaming(value: string | undefined): string | undefined {
+    const previous = process.env[OPENAI_COMPATIBLE_NON_STREAMING_ENV];
+    if (value === undefined) delete process.env[OPENAI_COMPATIBLE_NON_STREAMING_ENV];
+    else process.env[OPENAI_COMPATIBLE_NON_STREAMING_ENV] = value;
+    return previous;
+  }
+
+  function restoreNonStreaming(previous: string | undefined): void {
+    if (previous === undefined) delete process.env[OPENAI_COMPATIBLE_NON_STREAMING_ENV];
+    else process.env[OPENAI_COMPATIBLE_NON_STREAMING_ENV] = previous;
+  }
+
+  it("serves a streaming chat-completions POST as one non-streaming call", async () => {
+    const previous = setNonStreaming("1");
+    try {
+      let seen: { url: string; init?: RequestInit } | undefined;
+      const safeFetch = createOpenAiCompatibleFetch(
+        async (input, init) => {
+          seen = { url: String(input), init };
+          return Response.json(nonStreamingReply);
+        },
+        undefined,
+        OWNER,
+      );
+      const response = await safeFetch("http://127.0.0.1:8000/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "fixture-model",
+          messages: [{ role: "user", content: "Hi" }],
+          stream: true,
+          stream_options: { include_usage: true },
+        }),
+      });
+      const sent = JSON.parse(String(seen?.init?.body));
+      expect(sent.stream).toBe(false);
+      expect(sent.stream_options).toBeUndefined();
+      expect(sent.messages).toEqual([{ role: "user", content: "Hi" }]);
+      expect(response.headers.get("content-type")).toBe("text/event-stream");
+      const text = await response.text();
+      expect(text).toContain('"content":"Hello from the fixture."');
+      expect(text).toContain('"finish_reason":"stop"');
+      expect(text).toContain(
+        '"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}',
+      );
+      expect(text).toContain("data: [DONE]");
+    } finally {
+      restoreNonStreaming(previous);
+    }
+  });
+
+  it("leaves streaming chat-completions alone when the flag is off", async () => {
+    const previous = setNonStreaming(undefined);
+    try {
+      let seenBody: unknown;
+      const safeFetch = createOpenAiCompatibleFetch(
+        async (_input, init) => {
+          seenBody = JSON.parse(String(init?.body));
+          return new Response("data: [DONE]\n\n", {
+            headers: { "content-type": "text/event-stream" },
+          });
+        },
+        undefined,
+        OWNER,
+      );
+      const response = await safeFetch("http://127.0.0.1:8000/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "fixture-model", messages: [], stream: true }),
+      });
+      expect(seenBody).toMatchObject({ stream: true });
+      expect(await response.text()).toBe("data: [DONE]\n\n");
+    } finally {
+      restoreNonStreaming(previous);
+    }
+  });
+
+  it("passes error responses through without rewriting them", async () => {
+    const previous = setNonStreaming("1");
+    try {
+      const safeFetch = createOpenAiCompatibleFetch(
+        async () => new Response(JSON.stringify({ error: { message: "boom" } }), { status: 500 }),
+        undefined,
+        OWNER,
+      );
+      const response = await safeFetch("http://127.0.0.1:8000/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "fixture-model", messages: [], stream: true }),
+      });
+      expect(response.status).toBe(500);
+      expect(await response.text()).toBe(JSON.stringify({ error: { message: "boom" } }));
+    } finally {
+      restoreNonStreaming(previous);
+    }
+  });
+
+  it("returns the completed reply through the provider stream", async () => {
+    const previous = setNonStreaming("1");
+    try {
+      const models = registerOpenAiCompatibleCatalog(createModels());
+      registerOpenAiCompatibleRuntime(models, {
+        modelId: "fixture-model",
+        baseUrl: "http://127.0.0.1:8000/v1",
+        allowPrivate: true,
+      });
+      const provider = models.getProvider(OPENAI_COMPATIBLE_PROVIDER_ID)!;
+      const model = models.getModel(OPENAI_COMPATIBLE_PROVIDER_ID, "fixture-model")!;
+      const context = normalizeContext({
+        messages: [{ role: "user", content: [{ type: "text", text: "Hi" }], timestamp: 1 }],
+      });
+      const message = await provider
+        .streamSimple(model, context, {
+          apiKey: "fake-api-key",
+          fetch: async () => Response.json(nonStreamingReply),
+        })
+        .result();
+      expect(message.content).toEqual([{ type: "text", text: "Hello from the fixture." }]);
+      expect(message.stopReason).toBe("stop");
+      expect(message.usage?.input).toBe(10);
+      expect(message.usage?.output).toBe(5);
+    } finally {
+      restoreNonStreaming(previous);
+    }
+  });
+
+  it("returns tool calls from a non-streaming reply through the provider stream", async () => {
+    const previous = setNonStreaming("1");
+    try {
+      const models = registerOpenAiCompatibleCatalog(createModels());
+      registerOpenAiCompatibleRuntime(models, {
+        modelId: "fixture-model",
+        baseUrl: "http://127.0.0.1:8000/v1",
+        allowPrivate: true,
+      });
+      const provider = models.getProvider(OPENAI_COMPATIBLE_PROVIDER_ID)!;
+      const model = models.getModel(OPENAI_COMPATIBLE_PROVIDER_ID, "fixture-model")!;
+      const context = normalizeContext({
+        messages: [
+          { role: "user", content: [{ type: "text", text: "List my tasks" }], timestamp: 1 },
+        ],
+        tools: [
+          {
+            name: "list_tasks",
+            description: "List tasks",
+            parameters: { type: "object", properties: {} },
+          },
+        ],
+      });
+      const reply = {
+        ...nonStreamingReply,
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: "assistant",
+              content: null,
+              tool_calls: [
+                {
+                  id: "call_fixture",
+                  index: 0,
+                  type: "function",
+                  function: { name: "list_tasks", arguments: "{}" },
+                },
+              ],
+            },
+            finish_reason: "tool_calls",
+          },
+        ],
+      };
+      const message = await provider
+        .streamSimple(model, context, {
+          apiKey: "fake-api-key",
+          fetch: async () => Response.json(reply),
+        })
+        .result();
+      expect(message.stopReason).toBe("toolUse");
+      expect(message.content).toEqual([
+        expect.objectContaining({ type: "toolCall", id: "call_fixture", name: "list_tasks" }),
+      ]);
+    } finally {
+      restoreNonStreaming(previous);
+    }
+  });
+
+  it("sends the ngrok browser-warning opt-out to tunnel hosts only", async () => {
+    const seen: Array<string | null> = [];
+    const safeFetch = createOpenAiCompatibleFetch(
+      async (_input, init) => {
+        seen.push(new Headers(init?.headers).get("ngrok-skip-browser-warning"));
+        return new Response("{}", { status: 200 });
+      },
+      undefined,
+      OWNER,
+    );
+    await safeFetch("https://fixture.ngrok-free.dev/v1/models");
+    await safeFetch("https://models.example.test/v1/models");
+    expect(seen).toEqual(["true", null]);
+  });
+
+  it("logs the transport cause instead of swallowing it", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const safeFetch = createOpenAiCompatibleFetch(
+        async () => {
+          throw new TypeError("fetch failed", {
+            cause: new Error("Connect Timeout Error (attempted address: 10.0.0.1:443)"),
+          });
+        },
+        undefined,
+        OWNER,
+      );
+      await expect(safeFetch("https://localhost:8000/v1/models")).rejects.toThrow("fetch failed");
+      expect(error).toHaveBeenCalledWith(
+        expect.stringContaining("Connect Timeout Error (attempted address: 10.0.0.1:443)"),
+      );
+    } finally {
+      error.mockRestore();
+    }
   });
 });
