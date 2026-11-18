@@ -288,7 +288,6 @@ export async function persistModelCredential(
   actor: Actor,
   input: ModelCredentialInput,
   codexCatalog: CodexLiveCatalog,
-) {
   const prepared = await prepareModelCredential(deps, actor, input, codexCatalog);
   throwIfAborted(input.signal);
   const cred = await withTransactionRetry(() =>
@@ -312,11 +311,11 @@ export function createModelConnector(deps: RouterDeps, codexCatalog: CodexLiveCa
   ) => {
     const credential = await modelConnectionTarget(deps, actor, input.provider, input.credentialId);
     let plaintext: string;
+    // Hoisted so the pin check below can compare the new secret with the one it replaces.
+    let previousPlaintext: string | undefined;
     try {
-      let previousPlaintext: string | undefined;
       let omitVisionModelIds = false;
       if (credential) {
-        const secret = await deps.prisma.secret.findFirst({
           where: { id: credential.secretId, userId: actor.userId, spaceId: null },
           select: { ciphertext: true },
         });
@@ -378,7 +377,14 @@ export function createModelConnector(deps: RouterDeps, codexCatalog: CodexLiveCa
       // the same connection are last-write-wins.
       const saved = parseModelSecret(plaintext);
       if (credential)
-        await assertNoDanglingModelPins(deps, actor, credential, saved, input.modelId ?? "");
+        await assertNoDanglingModelPins(
+          deps,
+          actor,
+          credential,
+          saved,
+          input.modelId ?? "",
+          previousPlaintext,
+        );
     }
     return { plaintext, credential };
   };
