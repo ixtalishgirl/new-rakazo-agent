@@ -8463,6 +8463,8 @@ describe("openai-compatible enabled models", () => {
     expect(state.credential).toEqual(initialCredential);
   });
 
+
+  it("allows repointing the only connection at a new server while a bot and backups pin the old id", async () => { const { call } = fixture({ plaintext: secretText(["m-a", "m-b"]), defaultModel: "m-a", bots: [{ name: "Ada", modelId: "m-b" }], backups: ["m-b"], }); const result = await call("models/connect", { provider: compatible, baseUrl: "https://10.0.0.6:8443/v1", modelId: "m-c", enabledModelIds: ["m-c"], }); expect(result.status).toBe(200); });
   it.each(["bot", "routine", "backup"])(
     "keeps a working %s on another connection when saving this one",
     async (kind) => {
