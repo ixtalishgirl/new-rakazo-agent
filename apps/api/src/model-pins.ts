@@ -1,6 +1,6 @@
 import { ORPCError } from "@orpc/server";
-import type { CodexLiveCatalog, parseModelSecret } from "@rakazo/adapters";
-import { findConnectedModelCredential, validateConnectedModelChoice } from "@rakazo/adapters";
+import type { CodexLiveCatalog } from "@rakazo/adapters";
+import { findConnectedModelCredential, parseModelSecret, validateConnectedModelChoice } from "@rakazo/adapters";
 import type { Actor } from "@rakazo/contracts";
 import { OPENAI_COMPATIBLE_PROVIDER_ID, usableModelId } from "@rakazo/contracts";
 import { modelRoleTarget, runAsSystem } from "@rakazo/db";
@@ -71,7 +71,9 @@ export async function assertNoDanglingModelPins(
   connection: { id: string },
   secret: ReturnType<typeof parseModelSecret>,
   actorDefault: string,
+  /** Plaintext of the secret this save replaces, when the connection already exists. */ previousPlaintext?: string,
 ) {
+  if (secret.kind === "openai_compatible" && previousPlaintext) { try { const previous = parseModelSecret(previousPlaintext); if (previous.kind === "openai_compatible" && previous.baseUrl !== secret.baseUrl) { return; } } catch { } }
   const stored = secret.kind === "openai_compatible" ? (secret.enabledModelIds ?? []) : [];
   const pins = await compatibleModelPins(deps, actor, { notIn: stored });
   // The connection's own model is the account's, so it stays enabled in every Space.
