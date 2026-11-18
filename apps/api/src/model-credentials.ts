@@ -288,6 +288,7 @@ export async function persistModelCredential(
   actor: Actor,
   input: ModelCredentialInput,
   codexCatalog: CodexLiveCatalog,
+  )  {
   const prepared = await prepareModelCredential(deps, actor, input, codexCatalog);
   throwIfAborted(input.signal);
   const cred = await withTransactionRetry(() =>
@@ -316,6 +317,7 @@ export function createModelConnector(deps: RouterDeps, codexCatalog: CodexLiveCa
     try {
       let omitVisionModelIds = false;
       if (credential) {
+        const secret = await deps.prisma.secret.findFirst({
           where: { id: credential.secretId, userId: actor.userId, spaceId: null },
           select: { ciphertext: true },
         });
